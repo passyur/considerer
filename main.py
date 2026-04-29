@@ -687,6 +687,7 @@ async def on_ready():
 
 
 @tree.command(name="participate", description="Take part in a thought experiment")
+@app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
 async def participate(interaction: discord.Interaction):
     active = get_active_experiments()
 
@@ -716,6 +717,14 @@ async def participate(interaction: discord.Interaction):
         view = ExperimentPickerView(available, interaction.user.id, str(interaction.user))
         await interaction.response.send_message(
             "**Choose an experiment to participate in:**", view=view, ephemeral=True
+        )
+
+
+@participate.error
+async def participate_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandOnCooldown):
+        await interaction.response.send_message(
+            f"Please wait {error.retry_after:.0f}s before participating again.", ephemeral=True
         )
 
 
