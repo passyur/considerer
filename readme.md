@@ -2,20 +2,20 @@
 
 maybe [make a venv](https://docs.python.org/3/library/venv.html#module-venv)
 
-`bash
+```bash
 pip install -r requirements.txt
-`
+```
 
-`bash
+```bash
 cp .env.example .env
-`
+```
 put your credentials in `.env` only
 
 ### to run 
 
 assuming internet enabled machine
 
-`bash
+```bash
 python main.py
-`
+```
 
