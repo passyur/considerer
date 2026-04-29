@@ -1,0 +1,3 @@
+[submodule "sample-experiments"]
+	path = sample-experiments
+	url = https://github.com/passyur/sample-experiments.git
