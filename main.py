@@ -85,19 +85,16 @@ def get_variant_counts(experiment: str) -> dict[str, int]:
             "SELECT variant, COUNT(*) as n FROM responses WHERE experiment=? GROUP BY variant",
             (experiment,),
         ).fetchall()
-    counts = {"A": 0, "B": 0}
-    for row in rows:
-        counts[row["variant"]] = row["n"]
-    return counts
+    return {row["variant"]: row["n"] for row in rows}
 
 
-def assign_variant(experiment: str) -> str:
+def assign_variant(experiment: str, variant_keys: list[str]) -> str:
     counts = get_variant_counts(experiment)
-    if counts["A"] < counts["B"]:
-        return "A"
-    if counts["B"] < counts["A"]:
-        return "B"
-    return random.choice(["A", "B"])
+    for k in variant_keys:
+        counts.setdefault(k, 0)
+    min_count = min(counts[k] for k in variant_keys)
+    candidates = [k for k in variant_keys if counts[k] == min_count]
+    return random.choice(candidates)
 
 
 def record_response(experiment: str, user_id: int, username: str, variant: str, answer: str):
@@ -209,14 +206,16 @@ def validate_experiment(data: dict) -> list[str]:
     if not isinstance(variants, dict):
         errors.append("Missing `variants` mapping")
     else:
-        for v_key in ("A", "B"):
-            v = variants.get(v_key)
-            if not isinstance(v, dict):
-                errors.append(f"Missing variant `{v_key}`")
-                continue
-            for field in ("title", "text"):
-                if not v.get(field) or not isinstance(v[field], str):
-                    errors.append(f"Variant `{v_key}` is missing required field: `{field}`")
+        if len(variants) == 0:
+            errors.append("`variants` must have at least one entry")
+        else:
+            for v_key, v in variants.items():
+                if not isinstance(v, dict):
+                    errors.append(f"Variant `{v_key}` must be a mapping")
+                    continue
+                for field in ("title", "text"):
+                    if not v.get(field) or not isinstance(v[field], str):
+                        errors.append(f"Variant `{v_key}` is missing required field: `{field}`")
 
     if "questions" in data:
         questions = data["questions"]
@@ -579,7 +578,7 @@ class ExperimentPickerView(discord.ui.View):
                     content="You've already participated in that experiment.", view=None
                 )
                 return
-            variant_key = assign_variant(exp["name"])
+            variant_key = assign_variant(exp["name"], list(exp["variants"].keys()))
             session = SurveySession(exp, variant_key, interaction.user.id, self.username)
             view = build_survey_view(session)
             await interaction.response.edit_message(content=session.render_content(), view=view)
@@ -709,7 +708,7 @@ async def participate(interaction: discord.Interaction):
 
     if len(available) == 1:
         exp = available[0]
-        variant_key = assign_variant(exp["name"])
+        variant_key = assign_variant(exp["name"], list(exp["variants"].keys()))
         session = SurveySession(exp, variant_key, interaction.user.id, str(interaction.user))
         view = build_survey_view(session)
         await interaction.response.send_message(session.render_content(), view=view, ephemeral=True)
@@ -788,16 +787,16 @@ async def upload_experiment(interaction: discord.Interaction, file: discord.Atta
 
     normalized = normalize_experiment(data)
     q_count = len(normalized["questions"])
-    variant_a = data["variants"]["A"]["title"]
-    variant_b = data["variants"]["B"]["title"]
     count_after = len(active) if is_update else len(active) + 1
     action = "updated" if is_update else f"added ({count_after}/{MAX_ACTIVE_EXPERIMENTS} active)"
+    variant_lines = "\n".join(
+        f"Variant {k}: {v['title']}" for k, v in data["variants"].items()
+    )
 
     await interaction.followup.send(
         f"Experiment {action}!\n"
         f"**{name}** — {q_count} question{'s' if q_count != 1 else ''}\n"
-        f"Variant A: {variant_a}\n"
-        f"Variant B: {variant_b}",
+        f"{variant_lines}",
         ephemeral=True,
     )
 
@@ -848,9 +847,11 @@ async def results(interaction: discord.Interaction, experiment: str):
         await interaction.response.send_message(f"No responses yet for **{experiment}**.", ephemeral=True)
         return
 
-    tally: dict[str, dict[str, dict[str, int]]] = {"A": {}, "B": {}}
+    variant_keys = list(exp["variants"].keys())
+    tally: dict[str, dict[str, dict[str, int]]] = {v: {} for v in variant_keys}
     for row in rows:
         v = row["variant"]
+        tally.setdefault(v, {})
         for q_id, ans in _parse_answers(row["answer"]).items():
             tally[v].setdefault(q_id, {})
             tally[v][q_id][ans] = tally[v][q_id].get(ans, 0) + 1
@@ -861,7 +862,7 @@ async def results(interaction: discord.Interaction, experiment: str):
 
     question_texts = {q["id"]: q["text"] for q in exp["questions"]}
 
-    for v_key in ("A", "B"):
+    for v_key in variant_keys:
         v_data = exp["variants"].get(v_key)
         if not v_data:
             continue

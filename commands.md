@@ -77,4 +77,4 @@ questions:
     optional: true           # adds a skip button
 ```
 
-variants are assigned 50/50 (only support for 2 at the moment). answers aren't saved until the respondent hits submit.
+variants are assigned evenly. answers aren't saved until the respondent hits submit.
