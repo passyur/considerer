@@ -19,3 +19,6 @@ assuming internet enabled machine
 python main.py
 ```
 
+### when running
+
+see [commands.md](commands.md)
