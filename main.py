@@ -18,9 +18,10 @@ ADMIN_USER_IDS = set(
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
 )
 DB_PATH = os.getenv("DB_PATH", "results.db")
-EXPERIMENT_PATH = os.getenv("EXPERIMENT_PATH", "experiment.yaml")
+EXPERIMENT_PATH = os.getenv("EXPERIMENT_PATH", "experiment.yaml")  # used only for startup seed
 
 MAX_YAML_BYTES = 64 * 1024
+MAX_ACTIVE_EXPERIMENTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +57,15 @@ def db_init():
                 key      TEXT NOT NULL,
                 value    TEXT NOT NULL,
                 PRIMARY KEY (guild_id, key)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS experiments (
+                name       TEXT PRIMARY KEY,
+                config     TEXT NOT NULL,
+                active     INTEGER NOT NULL DEFAULT 1,
+                started_at TEXT DEFAULT (datetime('now')),
+                started_by TEXT NOT NULL DEFAULT 'system'
             )
         """)
 
@@ -129,14 +139,49 @@ def set_setting(guild_id: int, key: str, value: str):
         )
 
 
+def get_active_experiments() -> list[dict]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT config FROM experiments WHERE active=1 ORDER BY started_at"
+        ).fetchall()
+    return [json.loads(row["config"]) for row in rows]
+
+
+def get_experiment_by_name(name: str) -> dict | None:
+    """Returns config regardless of active status (so ended experiments are still queryable)."""
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT config FROM experiments WHERE name=?", (name,)
+        ).fetchone()
+    return json.loads(row["config"]) if row else None
+
+
+def is_active_experiment(name: str) -> bool:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM experiments WHERE name=? AND active=1", (name,)
+        ).fetchone()
+    return row is not None
+
+
+def add_experiment(name: str, config_json: str, started_by: str):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO experiments (name, config, active, started_by) VALUES (?,?,1,?) "
+            "ON CONFLICT(name) DO UPDATE SET config=excluded.config, active=1, "
+            "started_at=datetime('now'), started_by=excluded.started_by",
+            (name, config_json, started_by),
+        )
+
+
+def deactivate_experiment(name: str):
+    with db_connect() as conn:
+        conn.execute("UPDATE experiments SET active=0 WHERE name=?", (name,))
+
+
 # ---------------------------------------------------------------------------
 # Experiment config
 # ---------------------------------------------------------------------------
-
-def load_experiment() -> dict:
-    with open(EXPERIMENT_PATH) as f:
-        return yaml.safe_load(f)
-
 
 def normalize_experiment(exp: dict) -> dict:
     """Ensure exp has a 'questions' list. Handles legacy single-question format."""
@@ -234,10 +279,10 @@ def validate_experiment(data: dict) -> list[str]:
 # Permissions
 # ---------------------------------------------------------------------------
 # Role hierarchy (each level is strictly additive):
-#   admin            — hardcoded ADMIN_USER_IDS; full access including host filesystem
-#   server_admin     — Discord manage_guild permission; everything except host file I/O
+#   admin              — hardcoded ADMIN_USER_IDS; full access including host filesystem
+#   server_admin       — Discord manage_guild permission; everything except host file I/O
 #   experiment_manager — role set via /set_experiment_role; results + upload + export
-#   everyone         — /participate only
+#   everyone           — /participate only
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
@@ -273,7 +318,7 @@ class SurveySession:
         self.user_id = user_id
         self.username = username
         self.answers: dict[str, str] = {}
-        self.history: list[str] = []  # question ids answered, in order
+        self.history: list[str] = []
 
     @property
     def experiment_name(self) -> str:
@@ -292,7 +337,6 @@ class SurveySession:
         return all(self.answers.get(k) == v for k, v in cond.items())
 
     def current_question(self) -> dict | None:
-        """Next question to show: not yet answered, condition met."""
         answered = set(self.answers)
         for q in self.exp["questions"]:
             if q["id"] not in answered and self._condition_met(q):
@@ -305,7 +349,6 @@ class SurveySession:
             self.history.append(q_id)
 
     def go_back(self):
-        """Undo the last recorded answer."""
         if not self.history:
             return
         last_id = self.history.pop()
@@ -420,7 +463,6 @@ class SurveyFreetextModal(discord.ui.Modal):
         self.session.record_answer(self.question["id"], self.answer_input.value)
         view = build_survey_view(self.session)
         await interaction.response.defer()
-        # Edit the original ephemeral message via the button interaction's webhook token
         await self.button_interaction.edit_original_response(
             content=self.session.render_content(), view=view
         )
@@ -514,6 +556,37 @@ class SurveySubmitView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
+# Experiment picker (shown when multiple experiments are active)
+# ---------------------------------------------------------------------------
+
+class ExperimentPickerView(discord.ui.View):
+    def __init__(self, experiments: list[dict], user_id: int, username: str):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.username = username
+        for exp in experiments:
+            btn = discord.ui.Button(label=exp["name"][:80], style=discord.ButtonStyle.primary)
+            btn.callback = self._make_callback(exp)
+            self.add_item(btn)
+
+    def _make_callback(self, exp: dict):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message("This isn't your prompt!", ephemeral=True)
+                return
+            if has_participated(interaction.user.id, exp["name"]):
+                await interaction.response.edit_message(
+                    content="You've already participated in that experiment.", view=None
+                )
+                return
+            variant_key = assign_variant(exp["name"])
+            session = SurveySession(exp, variant_key, interaction.user.id, self.username)
+            view = build_survey_view(session)
+            await interaction.response.edit_message(content=session.render_content(), view=view)
+        return callback
+
+
+# ---------------------------------------------------------------------------
 # Admin views
 # ---------------------------------------------------------------------------
 
@@ -537,11 +610,10 @@ class ConfirmResetView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
-# Helpers for results/export with multi-question answers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _parse_answers(answer_str: str) -> dict[str, str]:
-    """Parse the answer column. Returns a dict of question_id -> answer."""
     try:
         parsed = json.loads(answer_str)
         if isinstance(parsed, dict):
@@ -549,6 +621,53 @@ def _parse_answers(answer_str: str) -> dict[str, str]:
     except (json.JSONDecodeError, ValueError):
         pass
     return {"q1": answer_str}  # legacy single-answer
+
+
+def _seed_from_file_if_empty():
+    """On first run, load experiment.yaml into the DB if no active experiments exist."""
+    if get_active_experiments():
+        return
+    if not os.path.exists(EXPERIMENT_PATH):
+        return
+    try:
+        with open(EXPERIMENT_PATH) as f:
+            data = yaml.safe_load(f)
+        if not validate_experiment(data):
+            add_experiment(data["name"], json.dumps(data), "startup")
+            print(f"Seeded initial experiment from {EXPERIMENT_PATH}: {data['name']}")
+    except Exception as exc:
+        print(f"Could not seed from {EXPERIMENT_PATH}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Autocomplete
+# ---------------------------------------------------------------------------
+
+async def active_experiment_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    return [
+        app_commands.Choice(name=e["name"], value=e["name"])
+        for e in get_active_experiments()
+        if not current or current.lower() in e["name"].lower()
+    ][:25]
+
+
+async def any_experiment_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT name, active FROM experiments ORDER BY active DESC, started_at DESC"
+        ).fetchall()
+    return [
+        app_commands.Choice(
+            name=row["name"] if row["active"] else f"{row['name']} (ended)",
+            value=row["name"],
+        )
+        for row in rows
+        if not current or current.lower() in row["name"].lower()
+    ][:25]
 
 
 # ---------------------------------------------------------------------------
@@ -563,25 +682,42 @@ tree = app_commands.CommandTree(client)
 @client.event
 async def on_ready():
     db_init()
+    _seed_from_file_if_empty()
     await tree.sync()
     print(f"Logged in as {client.user}  |  Commands synced")
 
 
-@tree.command(name="participate", description="Take part in the current thought experiment")
+@tree.command(name="participate", description="Take part in a thought experiment")
 async def participate(interaction: discord.Interaction):
-    exp = load_experiment()
-    name = exp["name"]
+    active = get_active_experiments()
 
-    if has_participated(interaction.user.id, name):
+    if not active:
         await interaction.response.send_message(
-            "You've already participated in this experiment. Thanks!", ephemeral=True
+            "No experiments are currently running.", ephemeral=True
         )
         return
 
-    variant_key = assign_variant(name)
-    session = SurveySession(exp, variant_key, interaction.user.id, str(interaction.user))
-    view = build_survey_view(session)
-    await interaction.response.send_message(session.render_content(), view=view, ephemeral=True)
+    available = [e for e in active if not has_participated(interaction.user.id, e["name"])]
+
+    if not available:
+        n = len(active)
+        await interaction.response.send_message(
+            f"You've already participated in all {n} running experiment{'s' if n != 1 else ''}. Thanks!",
+            ephemeral=True,
+        )
+        return
+
+    if len(available) == 1:
+        exp = available[0]
+        variant_key = assign_variant(exp["name"])
+        session = SurveySession(exp, variant_key, interaction.user.id, str(interaction.user))
+        view = build_survey_view(session)
+        await interaction.response.send_message(session.render_content(), view=view, ephemeral=True)
+    else:
+        view = ExperimentPickerView(available, interaction.user.id, str(interaction.user))
+        await interaction.response.send_message(
+            "**Choose an experiment to participate in:**", view=view, ephemeral=True
+        )
 
 
 @tree.command(name="set_experiment_role", description="[Server admin] Set which role can manage experiments")
@@ -598,7 +734,7 @@ async def set_experiment_role(interaction: discord.Interaction, role: discord.Ro
     )
 
 
-@tree.command(name="upload_experiment", description="Upload a YAML file to set the active experiment")
+@tree.command(name="upload_experiment", description="Upload a YAML file to add or update an experiment")
 @app_commands.describe(file="A .yaml file defining the experiment")
 async def upload_experiment(interaction: discord.Interaction, file: discord.Attachment):
     if not is_experiment_manager(interaction):
@@ -636,38 +772,82 @@ async def upload_experiment(interaction: discord.Interaction, file: discord.Atta
         )
         return
 
-    with open(EXPERIMENT_PATH, "wb") as f:
-        f.write(raw)
+    name = data["name"]
+    active = get_active_experiments()
+    is_update = any(e["name"] == name for e in active)
+
+    if not is_update and len(active) >= MAX_ACTIVE_EXPERIMENTS:
+        await interaction.followup.send(
+            f"There are already {MAX_ACTIVE_EXPERIMENTS} active experiments. "
+            f"End one with `/end_experiment` before adding a new one.",
+            ephemeral=True,
+        )
+        return
+
+    add_experiment(name, json.dumps(data), str(interaction.user.id))
 
     normalized = normalize_experiment(data)
     q_count = len(normalized["questions"])
     variant_a = data["variants"]["A"]["title"]
     variant_b = data["variants"]["B"]["title"]
+    count_after = len(active) if is_update else len(active) + 1
+    action = "updated" if is_update else f"added ({count_after}/{MAX_ACTIVE_EXPERIMENTS} active)"
 
     await interaction.followup.send(
-        f"Experiment set!\n"
-        f"**{data['name']}** — {q_count} question{'s' if q_count != 1 else ''}\n"
+        f"Experiment {action}!\n"
+        f"**{name}** — {q_count} question{'s' if q_count != 1 else ''}\n"
         f"Variant A: {variant_a}\n"
         f"Variant B: {variant_b}",
         ephemeral=True,
     )
 
 
-@tree.command(name="results", description="[Experiment manager] Show results summary for the current experiment")
-async def results(interaction: discord.Interaction):
+@tree.command(name="end_experiment", description="[Experiment manager] Stop accepting responses for an experiment")
+@app_commands.describe(experiment="The experiment to end")
+@app_commands.autocomplete(experiment=active_experiment_autocomplete)
+async def end_experiment(interaction: discord.Interaction, experiment: str):
+    if not (is_server_admin(interaction) or is_experiment_manager(interaction)):
+        await interaction.response.send_message(
+            "You don't have permission to end experiments.", ephemeral=True
+        )
+        return
+
+    if not is_active_experiment(experiment):
+        await interaction.response.send_message(
+            f"**{experiment}** is not currently active.", ephemeral=True
+        )
+        return
+
+    counts = get_variant_counts(experiment)
+    total = sum(counts.values())
+    deactivate_experiment(experiment)
+    await interaction.response.send_message(
+        f"**{experiment}** has ended. "
+        f"{total} response{'s' if total != 1 else ''} retained — use `/results` or `/export` to view them.",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="results", description="[Admin] Show results summary for an experiment")
+@app_commands.describe(experiment="The experiment to show results for")
+@app_commands.autocomplete(experiment=any_experiment_autocomplete)
+async def results(interaction: discord.Interaction, experiment: str):
     if not (is_server_admin(interaction) or is_experiment_manager(interaction)):
         await interaction.response.send_message("You don't have permission to view results.", ephemeral=True)
         return
 
-    exp = normalize_experiment(load_experiment())
-    name = exp["name"]
-    rows = get_results(name)
-
-    if not rows:
-        await interaction.response.send_message(f"No responses yet for **{name}**.", ephemeral=True)
+    exp_config = get_experiment_by_name(experiment)
+    if exp_config is None:
+        await interaction.response.send_message(f"No experiment named **{experiment}** found.", ephemeral=True)
         return
 
-    # tally[variant][question_id][answer] = count
+    exp = normalize_experiment(exp_config)
+    rows = get_results(experiment)
+
+    if not rows:
+        await interaction.response.send_message(f"No responses yet for **{experiment}**.", ephemeral=True)
+        return
+
     tally: dict[str, dict[str, dict[str, int]]] = {"A": {}, "B": {}}
     for row in rows:
         v = row["variant"]
@@ -676,7 +856,8 @@ async def results(interaction: discord.Interaction):
             tally[v][q_id][ans] = tally[v][q_id].get(ans, 0) + 1
 
     total = len(rows)
-    lines = [f"**Experiment: {name}** ({total} response{'s' if total != 1 else ''})\n"]
+    status = "" if is_active_experiment(experiment) else " — ended"
+    lines = [f"**{experiment}**{status} ({total} response{'s' if total != 1 else ''})\n"]
 
     question_texts = {q["id"]: q["text"] for q in exp["questions"]}
 
@@ -684,13 +865,11 @@ async def results(interaction: discord.Interaction):
         v_data = exp["variants"].get(v_key)
         if not v_data:
             continue
-        v_total = sum(sum(a.values()) for a in tally.get(v_key, {}).values())
-        # count unique respondents per variant
-        respondents = sum(
-            1 for row in rows if row["variant"] == v_key
+        respondents = sum(1 for row in rows if row["variant"] == v_key)
+        lines.append(
+            f"**Variant {v_key} — {v_data['title']}** "
+            f"({respondents} respondent{'s' if respondents != 1 else ''})"
         )
-        lines.append(f"**Variant {v_key} — {v_data['title']}** ({respondents} respondent{'s' if respondents != 1 else ''})")
-
         for q in exp["questions"]:
             q_id = q["id"]
             q_counts = tally.get(v_key, {}).get(q_id)
@@ -701,28 +880,32 @@ async def results(interaction: discord.Interaction):
             for ans, count in sorted(q_counts.items(), key=lambda x: -x[1]):
                 pct = count / q_total * 100
                 lines.append(f"    {ans}: {count} ({pct:.0f}%)")
-
         lines.append("")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@tree.command(name="export", description="[Experiment manager] Export results to a CSV file")
-async def export(interaction: discord.Interaction):
+@tree.command(name="export", description="[Experiment manager] Download results as a CSV")
+@app_commands.describe(experiment="The experiment to export")
+@app_commands.autocomplete(experiment=any_experiment_autocomplete)
+async def export(interaction: discord.Interaction, experiment: str):
     if not is_experiment_manager(interaction):
         await interaction.response.send_message("You don't have permission to export results.", ephemeral=True)
         return
 
-    exp = normalize_experiment(load_experiment())
-    name = exp["name"]
-    rows = get_results(name)
-
-    if not rows:
-        await interaction.response.send_message(f"No responses yet for **{name}**.", ephemeral=True)
+    exp_config = get_experiment_by_name(experiment)
+    if exp_config is None:
+        await interaction.response.send_message(f"No experiment named **{experiment}** found.", ephemeral=True)
         return
 
+    rows = get_results(experiment)
+    if not rows:
+        await interaction.response.send_message(f"No responses yet for **{experiment}**.", ephemeral=True)
+        return
+
+    exp = normalize_experiment(exp_config)
     question_ids = [q["id"] for q in exp["questions"]]
-    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in experiment)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"results_{safe_name}_{timestamp}.csv"
 
@@ -748,20 +931,23 @@ async def export(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="reset", description="[Experiment manager] Delete all responses for the current experiment")
-async def reset(interaction: discord.Interaction):
+@tree.command(name="reset", description="[Server admin] Delete all responses for an experiment")
+@app_commands.describe(experiment="The experiment to reset")
+@app_commands.autocomplete(experiment=any_experiment_autocomplete)
+async def reset(interaction: discord.Interaction, experiment: str):
     if not is_server_admin(interaction):
         await interaction.response.send_message("You don't have permission to reset results.", ephemeral=True)
         return
 
-    exp = load_experiment()
-    name = exp["name"]
-    counts = get_variant_counts(name)
-    total = sum(counts.values())
+    if get_experiment_by_name(experiment) is None:
+        await interaction.response.send_message(f"No experiment named **{experiment}** found.", ephemeral=True)
+        return
 
-    view = ConfirmResetView(name)
+    counts = get_variant_counts(experiment)
+    total = sum(counts.values())
+    view = ConfirmResetView(experiment)
     await interaction.response.send_message(
-        f"This will delete **{total}** response(s) for **{name}**. Are you sure?",
+        f"This will delete **{total}** response(s) for **{experiment}**. Are you sure?",
         view=view,
         ephemeral=True,
     )
