@@ -218,6 +218,9 @@ def validate_experiment(data: dict) -> list[str]:
     if not data.get("name") or not isinstance(data["name"], str):
         errors.append("Missing or empty required field: `name`")
 
+    if "description" in data and not isinstance(data["description"], str):
+        errors.append("`description` must be a string")
+
     variants = data.get("variants")
     if not isinstance(variants, dict):
         errors.append("Missing `variants` mapping")
@@ -883,6 +886,13 @@ async def upload_experiment(interaction: discord.Interaction, file: discord.Atta
         f"Experiment added ({count_after}/{MAX_ACTIVE_EXPERIMENTS} active)!\n{summary}",
         ephemeral=True,
     )
+
+    announcement = f"@here {interaction.user.mention} started a thought experiment: **{name}**"
+    description = data.get("description")
+    if description:
+        announcement += f"\nDescription: {description}"
+    announcement += "\nParticipate with `/participate`"
+    await interaction.channel.send(announcement)
 
 
 @tree.command(name="end_experiment", description="[Experiment manager] Stop accepting responses for an experiment")
