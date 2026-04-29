@@ -1,4 +1,5 @@
 import csv
+import json
 import os
 import random
 import sqlite3
@@ -18,7 +19,7 @@ ADMIN_USER_IDS = set(
 DB_PATH = os.getenv("DB_PATH", "results.db")
 EXPERIMENT_PATH = os.getenv("EXPERIMENT_PATH", "experiment.yaml")
 
-MAX_YAML_BYTES = 64 * 1024  # 64 KB sanity cap on uploaded experiment files
+MAX_YAML_BYTES = 64 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -136,26 +137,27 @@ def load_experiment() -> dict:
         return yaml.safe_load(f)
 
 
+def normalize_experiment(exp: dict) -> dict:
+    """Ensure exp has a 'questions' list. Handles legacy single-question format."""
+    if "questions" in exp:
+        return exp
+    exp = dict(exp)
+    exp["questions"] = [{
+        "id": "q1",
+        "text": exp.get("question", ""),
+        "answer_type": exp.get("answer_type", "freetext"),
+        "answer_options": exp.get("answer_options", []),
+    }]
+    return exp
+
+
 def validate_experiment(data: dict) -> list[str]:
-    """Return a list of human-readable error strings; empty means valid."""
     errors = []
     if not isinstance(data, dict):
         return ["File must be a YAML mapping at the top level."]
 
-    for field in ("name", "question"):
-        if not data.get(field) or not isinstance(data[field], str):
-            errors.append(f"Missing or empty required field: `{field}`")
-
-    answer_type = data.get("answer_type", "freetext")
-    if answer_type not in ("choice", "freetext"):
-        errors.append("`answer_type` must be `choice` or `freetext`")
-
-    if answer_type == "choice":
-        opts = data.get("answer_options")
-        if not opts or not isinstance(opts, list) or len(opts) < 2:
-            errors.append("`answer_options` must be a list with at least 2 items when `answer_type` is `choice`")
-        elif len(opts) > 5:
-            errors.append("`answer_options` must have at most 5 items (Discord button limit)")
+    if not data.get("name") or not isinstance(data["name"], str):
+        errors.append("Missing or empty required field: `name`")
 
     variants = data.get("variants")
     if not isinstance(variants, dict):
@@ -170,6 +172,60 @@ def validate_experiment(data: dict) -> list[str]:
                 if not v.get(field) or not isinstance(v[field], str):
                     errors.append(f"Variant `{v_key}` is missing required field: `{field}`")
 
+    if "questions" in data:
+        questions = data["questions"]
+        if not isinstance(questions, list) or len(questions) == 0:
+            errors.append("`questions` must be a non-empty list")
+        else:
+            seen_ids: set[str] = set()
+            for i, q in enumerate(questions):
+                label = q.get("id") or f"#{i + 1}"
+                if not isinstance(q, dict):
+                    errors.append(f"Question {label} must be a mapping")
+                    continue
+                q_id = q.get("id")
+                if not q_id or not isinstance(q_id, str):
+                    errors.append(f"Question {label} is missing a string `id`")
+                elif q_id in seen_ids:
+                    errors.append(f"Duplicate question id: `{q_id}`")
+                else:
+                    seen_ids.add(q_id)
+                if not q.get("text") or not isinstance(q["text"], str):
+                    errors.append(f"Question `{label}` is missing `text`")
+                answer_type = q.get("answer_type", "freetext")
+                if answer_type not in ("choice", "freetext"):
+                    errors.append(f"Question `{label}` has invalid `answer_type`")
+                if answer_type == "choice":
+                    opts = q.get("answer_options")
+                    if not opts or not isinstance(opts, list) or len(opts) < 2:
+                        errors.append(f"Question `{label}` needs at least 2 `answer_options`")
+                    elif len(opts) > 5:
+                        errors.append(f"Question `{label}` has too many `answer_options` (max 5)")
+                cond = q.get("if")
+                if cond is not None:
+                    if not isinstance(cond, dict):
+                        errors.append(f"Question `{label}` `if` must be a mapping")
+                    else:
+                        for ref_id in cond:
+                            if ref_id not in seen_ids:
+                                errors.append(
+                                    f"Question `{label}` `if` references unknown question `{ref_id}` "
+                                    f"(must appear before this question)"
+                                )
+    else:
+        # Legacy single-question format
+        if not data.get("question") or not isinstance(data["question"], str):
+            errors.append("Missing or empty required field: `question`")
+        answer_type = data.get("answer_type", "freetext")
+        if answer_type not in ("choice", "freetext"):
+            errors.append("`answer_type` must be `choice` or `freetext`")
+        if answer_type == "choice":
+            opts = data.get("answer_options")
+            if not opts or not isinstance(opts, list) or len(opts) < 2:
+                errors.append("`answer_options` must have at least 2 items")
+            elif len(opts) > 5:
+                errors.append("`answer_options` must have at most 5 items")
+
     return errors
 
 
@@ -178,7 +234,6 @@ def validate_experiment(data: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 async def has_experiment_permission(interaction: discord.Interaction) -> bool:
-    """True if the user is a hardcoded admin or has the server's experiment-manager role."""
     if interaction.user.id in ADMIN_USER_IDS:
         return True
     if interaction.guild_id is None:
@@ -190,86 +245,259 @@ async def has_experiment_permission(interaction: discord.Interaction) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Discord Views
+# Survey session
 # ---------------------------------------------------------------------------
 
-class AnswerChoiceView(discord.ui.View):
-    """Buttons for choice-type answers."""
-
-    def __init__(self, experiment: str, variant: str, options: list[str], user_id: int, username: str):
-        super().__init__(timeout=600)
-        self.experiment = experiment
-        self.variant = variant
+class SurveySession:
+    def __init__(self, exp: dict, variant_key: str, user_id: int, username: str):
+        self.exp = normalize_experiment(exp)
+        self.variant_key = variant_key
         self.user_id = user_id
         self.username = username
-        for option in options:
-            btn = discord.ui.Button(label=option, style=discord.ButtonStyle.primary)
-            btn.callback = self._make_callback(option)
+        self.answers: dict[str, str] = {}
+        self.history: list[str] = []  # question ids answered, in order
+
+    @property
+    def experiment_name(self) -> str:
+        return self.exp["name"]
+
+    def _question_by_id(self, q_id: str) -> dict:
+        for q in self.exp["questions"]:
+            if q["id"] == q_id:
+                return q
+        raise KeyError(q_id)
+
+    def _condition_met(self, q: dict) -> bool:
+        cond = q.get("if")
+        if cond is None:
+            return True
+        return all(self.answers.get(k) == v for k, v in cond.items())
+
+    def current_question(self) -> dict | None:
+        """Next question to show: not yet answered, condition met."""
+        answered = set(self.answers)
+        for q in self.exp["questions"]:
+            if q["id"] not in answered and self._condition_met(q):
+                return q
+        return None
+
+    def record_answer(self, q_id: str, answer: str):
+        self.answers[q_id] = answer
+        if q_id not in self.history:
+            self.history.append(q_id)
+
+    def go_back(self):
+        """Undo the last recorded answer."""
+        if not self.history:
+            return
+        last_id = self.history.pop()
+        self.answers.pop(last_id, None)
+
+    def render_content(self) -> str:
+        variant = self.exp["variants"][self.variant_key]
+        lines = [f"## {variant['title']}", "", variant["text"].strip(), "---", ""]
+
+        for q_id in self.history:
+            q = self._question_by_id(q_id)
+            ans = self.answers[q_id]
+            ans_display = "*(skipped)*" if ans == "" else f"**{ans}**"
+            lines.append(f"{q['text']}  →  {ans_display}")
+
+        current = self.current_question()
+        if current:
+            if self.history:
+                lines.append("")
+            lines.append(f"**{current['text']}**")
+        else:
+            lines.append("")
+            lines.append("*All done — submit when ready, or go back to change an answer.*")
+
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Survey views
+# ---------------------------------------------------------------------------
+
+def build_survey_view(session: SurveySession) -> discord.ui.View:
+    q = session.current_question()
+    if q is None:
+        return SurveySubmitView(session)
+    if q.get("answer_type", "freetext") == "choice":
+        return SurveyChoiceView(session, q)
+    return SurveyFreetextView(session, q)
+
+
+class SurveyChoiceView(discord.ui.View):
+    def __init__(self, session: SurveySession, question: dict):
+        super().__init__(timeout=600)
+        self.session = session
+        self.question = question
+
+        for option in question.get("answer_options", []):
+            btn = discord.ui.Button(label=option, style=discord.ButtonStyle.primary, row=0)
+            btn.callback = self._make_answer_callback(option)
             self.add_item(btn)
 
-    def _make_callback(self, option: str):
+        if question.get("optional"):
+            skip = discord.ui.Button(label="Skip", style=discord.ButtonStyle.secondary, row=1)
+            skip.callback = self._skip
+            self.add_item(skip)
+
+        if session.history:
+            back = discord.ui.Button(label="← Back", style=discord.ButtonStyle.secondary, row=1)
+            back.callback = self._go_back
+            self.add_item(back)
+
+    def _make_answer_callback(self, option: str):
         async def callback(interaction: discord.Interaction):
-            if interaction.user.id != self.user_id:
+            if interaction.user.id != self.session.user_id:
                 await interaction.response.send_message("This isn't your survey!", ephemeral=True)
                 return
-            if has_participated(self.user_id, self.experiment):
-                await interaction.response.send_message("You've already answered.", ephemeral=True)
-                return
-            record_response(self.experiment, self.user_id, self.username, self.variant, option)
-            self.clear_items()
-            await interaction.response.edit_message(
-                content=f"**Response recorded:** {option}\n\nThanks for participating!",
-                view=self,
-            )
+            self.session.record_answer(self.question["id"], option)
+            view = build_survey_view(self.session)
+            await interaction.response.edit_message(content=self.session.render_content(), view=view)
         return callback
 
-
-class FreetextAnswerModal(discord.ui.Modal):
-    answer = discord.ui.TextInput(
-        label="Your answer",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1000,
-    )
-
-    def __init__(self, question: str, experiment: str, variant: str, user_id: int, username: str):
-        super().__init__(title=question[:45])
-        self.experiment = experiment
-        self.variant = variant
-        self.user_id = user_id
-        self.username = username
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if has_participated(self.user_id, self.experiment):
-            await interaction.response.send_message("You've already answered.", ephemeral=True)
-            return
-        record_response(self.experiment, self.user_id, self.username, self.variant, self.answer.value)
-        await interaction.response.send_message(
-            "**Response recorded.** Thanks for participating!", ephemeral=True
-        )
-
-
-class OpenModalView(discord.ui.View):
-    """Single button that opens the freetext modal."""
-
-    def __init__(self, question: str, experiment: str, variant: str, user_id: int, username: str):
-        super().__init__(timeout=600)
-        self.question = question
-        self.experiment = experiment
-        self.variant = variant
-        self.user_id = user_id
-        self.username = username
-
-    @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary)
-    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
+    async def _skip(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
             await interaction.response.send_message("This isn't your survey!", ephemeral=True)
             return
-        modal = FreetextAnswerModal(
-            self.question, self.experiment, self.variant, self.user_id, self.username
+        self.session.record_answer(self.question["id"], "")
+        view = build_survey_view(self.session)
+        await interaction.response.edit_message(content=self.session.render_content(), view=view)
+
+    async def _go_back(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This isn't your survey!", ephemeral=True)
+            return
+        self.session.go_back()
+        view = build_survey_view(self.session)
+        await interaction.response.edit_message(content=self.session.render_content(), view=view)
+
+
+class SurveyFreetextModal(discord.ui.Modal):
+    def __init__(
+        self,
+        session: SurveySession,
+        question: dict,
+        button_interaction: discord.Interaction,
+        previous: str = "",
+    ):
+        super().__init__(title=question["text"][:45])
+        self.session = session
+        self.question = question
+        self.button_interaction = button_interaction
+
+        self.answer_input = discord.ui.TextInput(
+            label="Your answer",
+            style=discord.TextStyle.paragraph,
+            default=previous or None,
+            required=True,
+            max_length=1000,
         )
+        self.add_item(self.answer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.session.record_answer(self.question["id"], self.answer_input.value)
+        view = build_survey_view(self.session)
+        await interaction.response.defer()
+        # Edit the original ephemeral message via the button interaction's webhook token
+        await self.button_interaction.edit_original_response(
+            content=self.session.render_content(), view=view
+        )
+
+
+class SurveyFreetextView(discord.ui.View):
+    def __init__(self, session: SurveySession, question: dict):
+        super().__init__(timeout=600)
+        self.session = session
+        self.question = question
+
+        answer_btn = discord.ui.Button(label="Answer", style=discord.ButtonStyle.primary, row=0)
+        answer_btn.callback = self._open_modal
+        self.add_item(answer_btn)
+
+        if question.get("optional"):
+            skip_btn = discord.ui.Button(label="Skip", style=discord.ButtonStyle.secondary, row=0)
+            skip_btn.callback = self._skip
+            self.add_item(skip_btn)
+
+        if session.history:
+            back_btn = discord.ui.Button(label="← Back", style=discord.ButtonStyle.secondary, row=0)
+            back_btn.callback = self._go_back
+            self.add_item(back_btn)
+
+    async def _open_modal(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This isn't your survey!", ephemeral=True)
+            return
+        previous = self.session.answers.get(self.question["id"], "")
+        modal = SurveyFreetextModal(self.session, self.question, interaction, previous)
         await interaction.response.send_modal(modal)
 
+    async def _skip(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This isn't your survey!", ephemeral=True)
+            return
+        self.session.record_answer(self.question["id"], "")
+        view = build_survey_view(self.session)
+        await interaction.response.edit_message(content=self.session.render_content(), view=view)
+
+    async def _go_back(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This isn't your survey!", ephemeral=True)
+            return
+        self.session.go_back()
+        view = build_survey_view(self.session)
+        await interaction.response.edit_message(content=self.session.render_content(), view=view)
+
+
+class SurveySubmitView(discord.ui.View):
+    def __init__(self, session: SurveySession):
+        super().__init__(timeout=600)
+        self.session = session
+
+        submit_btn = discord.ui.Button(label="Submit", style=discord.ButtonStyle.success, row=0)
+        submit_btn.callback = self._submit
+        self.add_item(submit_btn)
+
+        back_btn = discord.ui.Button(label="← Back", style=discord.ButtonStyle.secondary, row=0)
+        back_btn.callback = self._go_back
+        self.add_item(back_btn)
+
+    async def _submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This isn't your survey!", ephemeral=True)
+            return
+        if has_participated(self.session.user_id, self.session.experiment_name):
+            await interaction.response.edit_message(
+                content="You've already submitted responses for this experiment.", view=None
+            )
+            return
+        record_response(
+            self.session.experiment_name,
+            self.session.user_id,
+            self.session.username,
+            self.session.variant_key,
+            json.dumps(self.session.answers),
+        )
+        await interaction.response.edit_message(
+            content="**Responses submitted!** Thanks for participating.", view=None
+        )
+
+    async def _go_back(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session.user_id:
+            await interaction.response.send_message("This isn't your survey!", ephemeral=True)
+            return
+        self.session.go_back()
+        view = build_survey_view(self.session)
+        await interaction.response.edit_message(content=self.session.render_content(), view=view)
+
+
+# ---------------------------------------------------------------------------
+# Admin views
+# ---------------------------------------------------------------------------
 
 class ConfirmResetView(discord.ui.View):
     def __init__(self, experiment: str):
@@ -288,6 +516,21 @@ class ConfirmResetView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.clear_items()
         await interaction.response.edit_message(content="Reset cancelled.", view=self)
+
+
+# ---------------------------------------------------------------------------
+# Helpers for results/export with multi-question answers
+# ---------------------------------------------------------------------------
+
+def _parse_answers(answer_str: str) -> dict[str, str]:
+    """Parse the answer column. Returns a dict of question_id -> answer."""
+    try:
+        parsed = json.loads(answer_str)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return {"q1": answer_str}  # legacy single-answer
 
 
 # ---------------------------------------------------------------------------
@@ -318,23 +561,9 @@ async def participate(interaction: discord.Interaction):
         return
 
     variant_key = assign_variant(name)
-    variant = exp["variants"][variant_key]
-    question = exp["question"]
-    answer_type = exp.get("answer_type", "freetext")
-
-    scenario_block = (
-        f"## {variant['title']}\n\n"
-        f"{variant['text'].strip()}\n\n"
-        f"**{question}**"
-    )
-
-    if answer_type == "choice":
-        options = exp.get("answer_options", ["Yes", "No"])
-        view = AnswerChoiceView(name, variant_key, options, interaction.user.id, str(interaction.user))
-        await interaction.response.send_message(scenario_block, view=view, ephemeral=True)
-    else:
-        view = OpenModalView(question, name, variant_key, interaction.user.id, str(interaction.user))
-        await interaction.response.send_message(scenario_block, view=view, ephemeral=True)
+    session = SurveySession(exp, variant_key, interaction.user.id, str(interaction.user))
+    view = build_survey_view(session)
+    await interaction.response.send_message(session.render_content(), view=view, ephemeral=True)
 
 
 @tree.command(name="set_experiment_role", description="[Server admin] Set which role can manage experiments")
@@ -352,7 +581,7 @@ async def set_experiment_role(interaction: discord.Interaction, role: discord.Ro
 
 
 @tree.command(name="upload_experiment", description="Upload a YAML file to set the active experiment")
-@app_commands.describe(file="A .yaml file defining the experiment (variants, question, answer type)")
+@app_commands.describe(file="A .yaml file defining the experiment")
 async def upload_experiment(interaction: discord.Interaction, file: discord.Attachment):
     if not await has_experiment_permission(interaction):
         await interaction.response.send_message(
@@ -392,15 +621,14 @@ async def upload_experiment(interaction: discord.Interaction, file: discord.Atta
     with open(EXPERIMENT_PATH, "wb") as f:
         f.write(raw)
 
-    name = data["name"]
-    answer_type = data.get("answer_type", "freetext")
+    normalized = normalize_experiment(data)
+    q_count = len(normalized["questions"])
     variant_a = data["variants"]["A"]["title"]
     variant_b = data["variants"]["B"]["title"]
 
     await interaction.followup.send(
         f"Experiment set!\n"
-        f"**{name}**\n"
-        f"Answer type: `{answer_type}`\n"
+        f"**{data['name']}** — {q_count} question{'s' if q_count != 1 else ''}\n"
         f"Variant A: {variant_a}\n"
         f"Variant B: {variant_b}",
         ephemeral=True,
@@ -413,7 +641,7 @@ async def results(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have permission to view results.", ephemeral=True)
         return
 
-    exp = load_experiment()
+    exp = normalize_experiment(load_experiment())
     name = exp["name"]
     rows = get_results(name)
 
@@ -421,28 +649,41 @@ async def results(interaction: discord.Interaction):
         await interaction.response.send_message(f"No responses yet for **{name}**.", ephemeral=True)
         return
 
-    tally: dict[str, dict[str, int]] = {"A": {}, "B": {}}
+    # tally[variant][question_id][answer] = count
+    tally: dict[str, dict[str, dict[str, int]]] = {"A": {}, "B": {}}
     for row in rows:
         v = row["variant"]
-        a = row["answer"]
-        tally[v][a] = tally[v].get(a, 0) + 1
+        for q_id, ans in _parse_answers(row["answer"]).items():
+            tally[v].setdefault(q_id, {})
+            tally[v][q_id][ans] = tally[v][q_id].get(ans, 0) + 1
 
     total = len(rows)
     lines = [f"**Experiment: {name}** ({total} response{'s' if total != 1 else ''})\n"]
+
+    question_texts = {q["id"]: q["text"] for q in exp["questions"]}
 
     for v_key in ("A", "B"):
         v_data = exp["variants"].get(v_key)
         if not v_data:
             continue
-        v_counts = tally.get(v_key, {})
-        v_total = sum(v_counts.values())
-        lines.append(f"**Variant {v_key} — {v_data['title']}** ({v_total} response{'s' if v_total != 1 else ''})")
-        if v_total == 0:
-            lines.append("  *(no responses yet)*")
-        else:
-            for answer, count in sorted(v_counts.items(), key=lambda x: -x[1]):
-                pct = count / v_total * 100
-                lines.append(f"  {answer}: {count} ({pct:.0f}%)")
+        v_total = sum(sum(a.values()) for a in tally.get(v_key, {}).values())
+        # count unique respondents per variant
+        respondents = sum(
+            1 for row in rows if row["variant"] == v_key
+        )
+        lines.append(f"**Variant {v_key} — {v_data['title']}** ({respondents} respondent{'s' if respondents != 1 else ''})")
+
+        for q in exp["questions"]:
+            q_id = q["id"]
+            q_counts = tally.get(v_key, {}).get(q_id)
+            if q_counts is None:
+                continue
+            q_total = sum(q_counts.values())
+            lines.append(f"  *{question_texts.get(q_id, q_id)}* ({q_total})")
+            for ans, count in sorted(q_counts.items(), key=lambda x: -x[1]):
+                pct = count / q_total * 100
+                lines.append(f"    {ans}: {count} ({pct:.0f}%)")
+
         lines.append("")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
@@ -454,7 +695,7 @@ async def export(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have permission to export results.", ephemeral=True)
         return
 
-    exp = load_experiment()
+    exp = normalize_experiment(load_experiment())
     name = exp["name"]
     rows = get_results(name)
 
@@ -462,16 +703,26 @@ async def export(interaction: discord.Interaction):
         await interaction.response.send_message(f"No responses yet for **{name}**.", ephemeral=True)
         return
 
+    question_ids = [q["id"] for q in exp["questions"]]
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"results_{safe_name}_{timestamp}.csv"
 
-    fields = ["experiment", "username", "user_id", "variant", "answer", "responded_at"]
+    fields = (
+        ["experiment", "username", "user_id", "variant"]
+        + [f"answer_{q_id}" for q_id in question_ids]
+        + ["responded_at"]
+    )
+
     with open(filename, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow(dict(row))
+            d = dict(row)
+            parsed = _parse_answers(d.pop("answer", "{}"))
+            for q_id in question_ids:
+                d[f"answer_{q_id}"] = parsed.get(q_id, "")
+            writer.writerow(d)
 
     await interaction.response.send_message(
         f"Exported {len(rows)} response(s) to `{filename}`.", ephemeral=True

@@ -1,17 +1,5 @@
-# Name uniquely identifies this experiment. Change it when you run a new one.
-# Responses are keyed by name, so renaming effectively starts a fresh dataset.
+# Name uniquely identifies this experiment — change it to start a fresh dataset.
 name: "Trolley Problem"
-
-question: "Would you pull the lever?"
-
-# answer_type: "choice"  — respondents click a button
-# answer_type: "freetext" — respondents type a free-form answer
-answer_type: choice
-
-# Only used when answer_type is "choice"
-answer_options:
-  - "Yes"
-  - "No"
 
 variants:
   A:
@@ -21,14 +9,40 @@ variants:
       You are standing next to a lever. If you pull it, the trolley will
       be diverted to a side track where only 1 person is tied.
 
-      You can pull the lever (killing 1) or do nothing (killing 5).
-
   B:
     title: "Footbridge Dilemma"
     text: |
       A runaway trolley is speeding toward 5 people tied to the tracks.
       You are standing on a footbridge above the tracks, next to a large
       stranger. The only way to stop the trolley is to push him off the
-      bridge onto the tracks below — his body will stop it, but he will die.
+      bridge — his body will stop it, but he will die.
 
-      You can push the stranger (killing 1) or do nothing (killing 5).
+questions:
+  - id: act
+    text: "Would you take the action (divert/push)?"
+    answer_type: choice
+    answer_options: ["Yes", "No"]
+
+  - id: reason_yes
+    text: "What's your main reason for acting?"
+    answer_type: choice
+    answer_options: ["Minimize total harm", "Moral duty to intervene", "Instinct"]
+    if:
+      act: "Yes"
+
+  - id: reason_no
+    text: "What's your main reason for not acting?"
+    answer_type: choice
+    answer_options: ["Wrong to directly cause harm", "Not my responsibility", "Instinct"]
+    if:
+      act: "No"
+
+  - id: confidence
+    text: "How confident are you in your answer?"
+    answer_type: choice
+    answer_options: ["Very confident", "Somewhat confident", "Uncertain"]
+
+  - id: reflection
+    text: "Anything else you'd like to add?"
+    answer_type: freetext
+    optional: true
