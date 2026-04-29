@@ -29,7 +29,7 @@ responses are ephemeral. you won't see which variant you got until after you ans
 | `/upload_experiment` | upload a `.yaml` file to start a new experiment (or replace an existing one's config without losing responses) |
 | `/end_experiment` | close an experiment to new responses — data is kept |
 | `/results` | see a breakdown of responses by variant and question |
-| `/export` | download a csv — sent as a file attachment, not written to the host |
+| `/export` | download a csv — sent as a file attachment |
 
 up to 5 experiments can be active at once.
 
