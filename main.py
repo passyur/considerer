@@ -466,8 +466,9 @@ async def export(interaction: discord.Interaction):
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"results_{safe_name}_{timestamp}.csv"
 
+    fields = ["experiment", "username", "user_id", "variant", "answer", "responded_at"]
     with open(filename, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["experiment", "username", "user_id", "variant", "answer", "responded_at"])
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(dict(row))
