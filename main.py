@@ -1,4 +1,5 @@
 import csv
+import io
 import json
 import os
 import random
@@ -232,9 +233,26 @@ def validate_experiment(data: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 # Permissions
 # ---------------------------------------------------------------------------
+# Role hierarchy (each level is strictly additive):
+#   admin            — hardcoded ADMIN_USER_IDS; full access including host filesystem
+#   server_admin     — Discord manage_guild permission; everything except host file I/O
+#   experiment_manager — role set via /set_experiment_role; results + upload + export
+#   everyone         — /participate only
 
-async def has_experiment_permission(interaction: discord.Interaction) -> bool:
-    if interaction.user.id in ADMIN_USER_IDS:
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+def is_server_admin(interaction: discord.Interaction) -> bool:
+    if is_admin(interaction.user.id):
+        return True
+    if not isinstance(interaction.user, discord.Member):
+        return False
+    return interaction.user.guild_permissions.manage_guild
+
+
+def is_experiment_manager(interaction: discord.Interaction) -> bool:
+    if is_admin(interaction.user.id):
         return True
     if interaction.guild_id is None:
         return False
@@ -569,7 +587,7 @@ async def participate(interaction: discord.Interaction):
 @tree.command(name="set_experiment_role", description="[Server admin] Set which role can manage experiments")
 @app_commands.describe(role="The role to grant experiment-management permissions")
 async def set_experiment_role(interaction: discord.Interaction, role: discord.Role):
-    if not interaction.user.guild_permissions.manage_guild:
+    if not is_server_admin(interaction):
         await interaction.response.send_message(
             "You need the **Manage Server** permission to set this.", ephemeral=True
         )
@@ -583,7 +601,7 @@ async def set_experiment_role(interaction: discord.Interaction, role: discord.Ro
 @tree.command(name="upload_experiment", description="Upload a YAML file to set the active experiment")
 @app_commands.describe(file="A .yaml file defining the experiment")
 async def upload_experiment(interaction: discord.Interaction, file: discord.Attachment):
-    if not await has_experiment_permission(interaction):
+    if not is_experiment_manager(interaction):
         await interaction.response.send_message(
             "You don't have permission to manage experiments.", ephemeral=True
         )
@@ -637,7 +655,7 @@ async def upload_experiment(interaction: discord.Interaction, file: discord.Atta
 
 @tree.command(name="results", description="[Experiment manager] Show results summary for the current experiment")
 async def results(interaction: discord.Interaction):
-    if not await has_experiment_permission(interaction):
+    if not (is_server_admin(interaction) or is_experiment_manager(interaction)):
         await interaction.response.send_message("You don't have permission to view results.", ephemeral=True)
         return
 
@@ -691,7 +709,7 @@ async def results(interaction: discord.Interaction):
 
 @tree.command(name="export", description="[Experiment manager] Export results to a CSV file")
 async def export(interaction: discord.Interaction):
-    if not await has_experiment_permission(interaction):
+    if not is_experiment_manager(interaction):
         await interaction.response.send_message("You don't have permission to export results.", ephemeral=True)
         return
 
@@ -714,24 +732,25 @@ async def export(interaction: discord.Interaction):
         + ["responded_at"]
     )
 
-    with open(filename, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            d = dict(row)
-            parsed = _parse_answers(d.pop("answer", "{}"))
-            for q_id in question_ids:
-                d[f"answer_{q_id}"] = parsed.get(q_id, "")
-            writer.writerow(d)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        d = dict(row)
+        parsed = _parse_answers(d.pop("answer", "{}"))
+        for q_id in question_ids:
+            d[f"answer_{q_id}"] = parsed.get(q_id, "")
+        writer.writerow(d)
 
+    attachment = discord.File(io.BytesIO(buf.getvalue().encode()), filename=filename)
     await interaction.response.send_message(
-        f"Exported {len(rows)} response(s) to `{filename}`.", ephemeral=True
+        f"{len(rows)} response(s)", file=attachment, ephemeral=True
     )
 
 
 @tree.command(name="reset", description="[Experiment manager] Delete all responses for the current experiment")
 async def reset(interaction: discord.Interaction):
-    if not await has_experiment_permission(interaction):
+    if not is_server_admin(interaction):
         await interaction.response.send_message("You don't have permission to reset results.", ephemeral=True)
         return
 
