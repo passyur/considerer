@@ -18,6 +18,8 @@ ADMIN_USER_IDS = set(
 DB_PATH = os.getenv("DB_PATH", "results.db")
 EXPERIMENT_PATH = os.getenv("EXPERIMENT_PATH", "experiment.yaml")
 
+MAX_YAML_BYTES = 64 * 1024  # 64 KB sanity cap on uploaded experiment files
+
 
 # ---------------------------------------------------------------------------
 # Database
@@ -45,6 +47,14 @@ def db_init():
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_user_experiment
             ON responses(user_id, experiment)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                guild_id TEXT NOT NULL,
+                key      TEXT NOT NULL,
+                value    TEXT NOT NULL,
+                PRIMARY KEY (guild_id, key)
+            )
         """)
 
 
@@ -99,6 +109,24 @@ def delete_results(experiment: str):
         conn.execute("DELETE FROM responses WHERE experiment=?", (experiment,))
 
 
+def get_setting(guild_id: int, key: str) -> str | None:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE guild_id=? AND key=?",
+            (str(guild_id), key),
+        ).fetchone()
+    return row["value"] if row else None
+
+
+def set_setting(guild_id: int, key: str, value: str):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO settings (guild_id, key, value) VALUES (?,?,?) "
+            "ON CONFLICT(guild_id, key) DO UPDATE SET value=excluded.value",
+            (str(guild_id), key, value),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Experiment config
 # ---------------------------------------------------------------------------
@@ -106,6 +134,59 @@ def delete_results(experiment: str):
 def load_experiment() -> dict:
     with open(EXPERIMENT_PATH) as f:
         return yaml.safe_load(f)
+
+
+def validate_experiment(data: dict) -> list[str]:
+    """Return a list of human-readable error strings; empty means valid."""
+    errors = []
+    if not isinstance(data, dict):
+        return ["File must be a YAML mapping at the top level."]
+
+    for field in ("name", "question"):
+        if not data.get(field) or not isinstance(data[field], str):
+            errors.append(f"Missing or empty required field: `{field}`")
+
+    answer_type = data.get("answer_type", "freetext")
+    if answer_type not in ("choice", "freetext"):
+        errors.append("`answer_type` must be `choice` or `freetext`")
+
+    if answer_type == "choice":
+        opts = data.get("answer_options")
+        if not opts or not isinstance(opts, list) or len(opts) < 2:
+            errors.append("`answer_options` must be a list with at least 2 items when `answer_type` is `choice`")
+        elif len(opts) > 5:
+            errors.append("`answer_options` must have at most 5 items (Discord button limit)")
+
+    variants = data.get("variants")
+    if not isinstance(variants, dict):
+        errors.append("Missing `variants` mapping")
+    else:
+        for v_key in ("A", "B"):
+            v = variants.get(v_key)
+            if not isinstance(v, dict):
+                errors.append(f"Missing variant `{v_key}`")
+                continue
+            for field in ("title", "text"):
+                if not v.get(field) or not isinstance(v[field], str):
+                    errors.append(f"Variant `{v_key}` is missing required field: `{field}`")
+
+    return errors
+
+
+# ---------------------------------------------------------------------------
+# Permissions
+# ---------------------------------------------------------------------------
+
+async def has_experiment_permission(interaction: discord.Interaction) -> bool:
+    """True if the user is a hardcoded admin or has the server's experiment-manager role."""
+    if interaction.user.id in ADMIN_USER_IDS:
+        return True
+    if interaction.guild_id is None:
+        return False
+    role_id = get_setting(interaction.guild_id, "experiment_manager_role_id")
+    if role_id and isinstance(interaction.user, discord.Member):
+        return any(str(r.id) == role_id for r in interaction.user.roles)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +306,6 @@ async def on_ready():
     print(f"Logged in as {client.user}  |  Commands synced")
 
 
-def _is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_USER_IDS
-
-
 @tree.command(name="participate", description="Take part in the current thought experiment")
 async def participate(interaction: discord.Interaction):
     exp = load_experiment()
@@ -260,10 +337,80 @@ async def participate(interaction: discord.Interaction):
         await interaction.response.send_message(scenario_block, view=view, ephemeral=True)
 
 
-@tree.command(name="results", description="[Admin] Show results summary for the current experiment")
+@tree.command(name="set_experiment_role", description="[Server admin] Set which role can manage experiments")
+@app_commands.describe(role="The role to grant experiment-management permissions")
+async def set_experiment_role(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "You need the **Manage Server** permission to set this.", ephemeral=True
+        )
+        return
+    set_setting(interaction.guild_id, "experiment_manager_role_id", str(role.id))
+    await interaction.response.send_message(
+        f"Members with the **{role.name}** role can now manage experiments.", ephemeral=True
+    )
+
+
+@tree.command(name="upload_experiment", description="Upload a YAML file to set the active experiment")
+@app_commands.describe(file="A .yaml file defining the experiment (variants, question, answer type)")
+async def upload_experiment(interaction: discord.Interaction, file: discord.Attachment):
+    if not await has_experiment_permission(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to manage experiments.", ephemeral=True
+        )
+        return
+
+    if not file.filename.endswith((".yaml", ".yml")):
+        await interaction.response.send_message(
+            "Please upload a `.yaml` or `.yml` file.", ephemeral=True
+        )
+        return
+
+    if file.size > MAX_YAML_BYTES:
+        await interaction.response.send_message(
+            f"File is too large (max {MAX_YAML_BYTES // 1024} KB).", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    raw = await file.read()
+    try:
+        data = yaml.safe_load(raw.decode("utf-8"))
+    except (yaml.YAMLError, UnicodeDecodeError) as exc:
+        await interaction.followup.send(f"Could not parse YAML: `{exc}`", ephemeral=True)
+        return
+
+    errors = validate_experiment(data)
+    if errors:
+        error_list = "\n".join(f"• {e}" for e in errors)
+        await interaction.followup.send(
+            f"The file has {len(errors)} error(s):\n{error_list}", ephemeral=True
+        )
+        return
+
+    with open(EXPERIMENT_PATH, "wb") as f:
+        f.write(raw)
+
+    name = data["name"]
+    answer_type = data.get("answer_type", "freetext")
+    variant_a = data["variants"]["A"]["title"]
+    variant_b = data["variants"]["B"]["title"]
+
+    await interaction.followup.send(
+        f"Experiment set!\n"
+        f"**{name}**\n"
+        f"Answer type: `{answer_type}`\n"
+        f"Variant A: {variant_a}\n"
+        f"Variant B: {variant_b}",
+        ephemeral=True,
+    )
+
+
+@tree.command(name="results", description="[Experiment manager] Show results summary for the current experiment")
 async def results(interaction: discord.Interaction):
-    if not _is_admin(interaction.user.id):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
+    if not await has_experiment_permission(interaction):
+        await interaction.response.send_message("You don't have permission to view results.", ephemeral=True)
         return
 
     exp = load_experiment()
@@ -274,7 +421,6 @@ async def results(interaction: discord.Interaction):
         await interaction.response.send_message(f"No responses yet for **{name}**.", ephemeral=True)
         return
 
-    # tally by variant → answer
     tally: dict[str, dict[str, int]] = {"A": {}, "B": {}}
     for row in rows:
         v = row["variant"]
@@ -302,10 +448,10 @@ async def results(interaction: discord.Interaction):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@tree.command(name="export", description="[Admin] Export results to a CSV file")
+@tree.command(name="export", description="[Experiment manager] Export results to a CSV file")
 async def export(interaction: discord.Interaction):
-    if not _is_admin(interaction.user.id):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
+    if not await has_experiment_permission(interaction):
+        await interaction.response.send_message("You don't have permission to export results.", ephemeral=True)
         return
 
     exp = load_experiment()
@@ -331,10 +477,10 @@ async def export(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="reset", description="[Admin] Delete all responses for the current experiment")
+@tree.command(name="reset", description="[Experiment manager] Delete all responses for the current experiment")
 async def reset(interaction: discord.Interaction):
-    if not _is_admin(interaction.user.id):
-        await interaction.response.send_message("Admin only.", ephemeral=True)
+    if not await has_experiment_permission(interaction):
+        await interaction.response.send_message("You don't have permission to reset results.", ephemeral=True)
         return
 
     exp = load_experiment()
