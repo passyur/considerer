@@ -113,6 +113,19 @@ def get_results(experiment: str) -> list[sqlite3.Row]:
         ).fetchall()
 
 
+def count_responses(experiment: str) -> int:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM responses WHERE experiment=?", (experiment,)
+        ).fetchone()
+    return row[0] if row else 0
+
+
+def update_experiment_config(name: str, config_json: str):
+    with db_connect() as conn:
+        conn.execute("UPDATE experiments SET config=? WHERE name=?", (config_json, name))
+
+
 def delete_results(experiment: str):
     with db_connect() as conn:
         conn.execute("DELETE FROM responses WHERE experiment=?", (experiment,))
@@ -608,6 +621,38 @@ class ConfirmResetView(discord.ui.View):
         await interaction.response.edit_message(content="Reset cancelled.", view=self)
 
 
+class ConfirmExperimentUpdateView(discord.ui.View):
+    def __init__(self, name: str, config_json: str, summary: str):
+        super().__init__(timeout=60)
+        self.name = name
+        self.config_json = config_json
+        self.summary = summary
+
+    @discord.ui.button(label="Update config", style=discord.ButtonStyle.primary)
+    async def update_only(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_experiment_config(self.name, self.config_json)
+        self.clear_items()
+        await interaction.response.edit_message(
+            content=f"Experiment updated (existing responses preserved).\n{self.summary}",
+            view=self,
+        )
+
+    @discord.ui.button(label="Update + reset responses", style=discord.ButtonStyle.danger)
+    async def update_and_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        update_experiment_config(self.name, self.config_json)
+        delete_results(self.name)
+        self.clear_items()
+        await interaction.response.edit_message(
+            content=f"Experiment updated and all responses reset.\n{self.summary}",
+            view=self,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.clear_items()
+        await interaction.response.edit_message(content="Upload cancelled.", view=self)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -792,20 +837,37 @@ async def upload_experiment(interaction: discord.Interaction, file: discord.Atta
         )
         return
 
-    add_experiment(name, json.dumps(data), str(interaction.user.id))
-
     normalized = normalize_experiment(data)
     q_count = len(normalized["questions"])
-    count_after = len(active) if is_update else len(active) + 1
-    action = "updated" if is_update else f"added ({count_after}/{MAX_ACTIVE_EXPERIMENTS} active)"
     variant_lines = "\n".join(
         f"Variant {k}: {v['title']}" for k, v in data["variants"].items()
     )
+    config_json = json.dumps(data)
+    summary = f"**{name}** — {q_count} question{'s' if q_count != 1 else ''}\n{variant_lines}"
 
+    if is_update:
+        n = count_responses(name)
+        response_word = f"{n} response{'s' if n != 1 else ''}"
+        view = ConfirmExperimentUpdateView(name, config_json, summary)
+        corruption_warning = (
+            "\n⚠️ Keeping existing responses may cause **data corruption**: "
+            "old answers were recorded against the previous question and variant "
+            "definitions, so mixed results will be unreliable."
+            if n > 0 else ""
+        )
+        await interaction.followup.send(
+            f"**{name}** already exists with {response_word}. "
+            f"Update the config, or update and reset all responses?"
+            f"{corruption_warning}",
+            view=view,
+            ephemeral=True,
+        )
+        return
+
+    add_experiment(name, config_json, str(interaction.user.id))
+    count_after = len(active) + 1
     await interaction.followup.send(
-        f"Experiment {action}!\n"
-        f"**{name}** — {q_count} question{'s' if q_count != 1 else ''}\n"
-        f"{variant_lines}",
+        f"Experiment added ({count_after}/{MAX_ACTIVE_EXPERIMENTS} active)!\n{summary}",
         ephemeral=True,
     )
 
