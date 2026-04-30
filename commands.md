@@ -2,7 +2,7 @@
 
 ## server setup (do this once)
 
-invite the bot with `bot` + `applications.commands` scopes + send & mention permissions (`permissions==133120`)
+invite the bot with `bot` + `applications.commands` scopes + send & mention permissions (`permissions=133120`)
 
 then as someone with **Manage Server**:
 
