@@ -17,6 +17,9 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_USER_IDS = set(
     int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
 )
+ALLOWED_GUILD_IDS = set(
+    int(x.strip()) for x in os.getenv("ALLOWED_GUILD_IDS", "").split(",") if x.strip()
+)
 DB_PATH = os.getenv("DB_PATH", "results.db")
 EXPERIMENT_PATH = os.getenv("EXPERIMENT_PATH", "experiment.yaml")  # used only for startup seed
 
@@ -718,9 +721,19 @@ async def any_experiment_autocomplete(
 # Bot
 # ---------------------------------------------------------------------------
 
+class BotCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if ALLOWED_GUILD_IDS and interaction.guild_id not in ALLOWED_GUILD_IDS:
+            await interaction.response.send_message(
+                "This bot is not enabled for this server.", ephemeral=True
+            )
+            return False
+        return True
+
+
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+tree = BotCommandTree(client)
 
 
 @client.event
