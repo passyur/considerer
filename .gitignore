@@ -7,3 +7,5 @@ __pycache__/
 venv/
 
 experiments.yaml
+
+.DS_Store
