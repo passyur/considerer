@@ -990,7 +990,10 @@ async def results(interaction: discord.Interaction, experiment: str):
                     lines.append(f"    {ans}: {count} ({pct:.0f}%)")
         lines.append("")
 
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    content = "\n".join(lines)
+    if len(content) > 2000:
+        content = content[:1997] + "…"
+    await interaction.response.send_message(content, ephemeral=True)
 
 
 @tree.command(name="export", description="[Experiment manager] Download results as a CSV")
