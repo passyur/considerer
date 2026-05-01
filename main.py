@@ -379,7 +379,11 @@ class SurveySession:
         for q_id in self.history:
             q = self._question_by_id(q_id)
             ans = self.answers[q_id]
-            ans_display = "*(skipped)*" if ans == "" else f"**{ans}**"
+            if ans == "":
+                ans_display = "*(skipped)*"
+            else:
+                truncated = ans if len(ans) <= 80 else ans[:80] + "…"
+                ans_display = f"**{truncated}**"
             lines.append(f"{q['text']}  →  {ans_display}")
 
         current = self.current_question()
@@ -391,7 +395,10 @@ class SurveySession:
             lines.append("")
             lines.append("*All done — submit when ready, or go back to change an answer.*")
 
-        return "\n".join(lines)
+        content = "\n".join(lines)
+        if len(content) > 2000:
+            content = content[:1997] + "…"
+        return content
 
 
 # ---------------------------------------------------------------------------
