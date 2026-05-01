@@ -979,9 +979,15 @@ async def results(interaction: discord.Interaction, experiment: str):
                 continue
             q_total = sum(q_counts.values())
             lines.append(f"  *{question_texts.get(q_id, q_id)}* ({q_total})")
-            for ans, count in sorted(q_counts.items(), key=lambda x: -x[1]):
-                pct = count / q_total * 100
-                lines.append(f"    {ans}: {count} ({pct:.0f}%)")
+            if q.get("answer_type", "freetext") == "freetext":
+                skipped = q_counts.get("", 0)
+                responded = q_total - skipped
+                lines.append(f"    {skipped}: no response (skipped)")
+                lines.append(f"    {responded}: response")
+            else:
+                for ans, count in sorted(q_counts.items(), key=lambda x: -x[1]):
+                    pct = count / q_total * 100
+                    lines.append(f"    {ans}: {count} ({pct:.0f}%)")
         lines.append("")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
