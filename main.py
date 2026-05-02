@@ -4,9 +4,13 @@ import json
 import os
 import random
 import sqlite3
+import textwrap
 from datetime import datetime, timezone
 
 import discord
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import yaml
 from discord import app_commands
 from dotenv import load_dotenv
@@ -928,6 +932,66 @@ async def end_experiment(interaction: discord.Interaction, experiment: str):
     )
 
 
+def _build_results_chart(
+    exp: dict,
+    tally: dict[str, dict[str, dict[str, int]]],
+    rows: list,
+) -> "discord.File | None":
+    choice_questions = [
+        q for q in exp["questions"]
+        if q.get("answer_type", "freetext") == "choice"
+        and any(tally.get(v, {}).get(q["id"]) for v in tally)
+    ]
+    if not choice_questions:
+        return None
+
+    variant_keys = list(exp["variants"].keys())
+    active_variants = [v for v in variant_keys if any(r["variant"] == v for r in rows)]
+    multi_variant = len(active_variants) > 1
+
+    n_questions = len(choice_questions)
+    fig, axes = plt.subplots(1, n_questions, figsize=(max(5, 4 * n_questions), 5), squeeze=False)
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    for col, q in enumerate(choice_questions):
+        ax = axes[0][col]
+        q_id = q["id"]
+        options = q.get("answer_options", [])
+        n_options = len(options)
+        n_variants = len(active_variants)
+        bar_width = 0.8 / n_variants if multi_variant else 0.5
+        x = range(n_options)
+
+        for vi, v_key in enumerate(active_variants):
+            v_data = exp["variants"].get(v_key, {})
+            v_respondents = sum(1 for r in rows if r["variant"] == v_key)
+            q_counts = tally.get(v_key, {}).get(q_id, {})
+            q_total = sum(q_counts.values()) or 1
+            percentages = [q_counts.get(opt, 0) / q_total * 100 for opt in options]
+
+            offsets = [xi + vi * bar_width - (n_variants - 1) * bar_width / 2 for xi in x]
+            v_label = v_data.get("label", v_data.get("title", v_key))
+            legend_label = f"{v_key} — {v_label} (n={v_respondents})" if multi_variant else None
+            ax.bar(offsets, percentages, width=bar_width, color=colors[vi % len(colors)], label=legend_label)
+
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(options, fontsize=9)
+        ax.set_ylabel("%")
+        ax.set_ylim(0, 100)
+        title_text = q.get("label", q["text"])
+        ax.set_title(textwrap.fill(title_text, width=32), fontsize=9, linespacing=1.3)
+        if multi_variant and col == n_questions - 1:
+            ax.legend(fontsize=8, loc="upper right")
+
+    plt.tight_layout(pad=1.5)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    return discord.File(buf, filename="results.png")
+
+
 @tree.command(name="results", description="[Admin] Show results summary for an experiment")
 @app_commands.describe(experiment="The experiment to show results for")
 @app_commands.autocomplete(experiment=any_experiment_autocomplete)
@@ -941,11 +1005,13 @@ async def results(interaction: discord.Interaction, experiment: str):
         await interaction.response.send_message(f"No experiment named **{experiment}** found.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     exp = normalize_experiment(exp_config)
     rows = get_results(experiment)
 
     if not rows:
-        await interaction.response.send_message(f"No responses yet for **{experiment}**.", ephemeral=True)
+        await interaction.followup.send(f"No responses yet for **{experiment}**.", ephemeral=True)
         return
 
     variant_keys = list(exp["variants"].keys())
@@ -961,8 +1027,6 @@ async def results(interaction: discord.Interaction, experiment: str):
     status = "" if is_active_experiment(experiment) else " — ended"
     lines = [f"**{experiment}**{status} ({total} response{'s' if total != 1 else ''})\n"]
 
-    question_texts = {q["id"]: q["text"] for q in exp["questions"]}
-
     for v_key in variant_keys:
         v_data = exp["variants"].get(v_key)
         if not v_data:
@@ -973,27 +1037,29 @@ async def results(interaction: discord.Interaction, experiment: str):
             f"({respondents} respondent{'s' if respondents != 1 else ''})"
         )
         for q in exp["questions"]:
+            if q.get("answer_type", "freetext") != "freetext":
+                continue
             q_id = q["id"]
             q_counts = tally.get(v_key, {}).get(q_id)
             if q_counts is None:
                 continue
             q_total = sum(q_counts.values())
-            lines.append(f"  *{question_texts.get(q_id, q_id)}* ({q_total})")
-            if q.get("answer_type", "freetext") == "freetext":
-                skipped = q_counts.get("", 0)
-                responded = q_total - skipped
-                lines.append(f"    {skipped}: no response (skipped)")
-                lines.append(f"    {responded}: response")
-            else:
-                for ans, count in sorted(q_counts.items(), key=lambda x: -x[1]):
-                    pct = count / q_total * 100
-                    lines.append(f"    {ans}: {count} ({pct:.0f}%)")
+            skipped = q_counts.get("", 0)
+            responded = q_total - skipped
+            lines.append(f"  *{q['text']}* ({q_total})")
+            lines.append(f"    {responded}: non-empty responses")
+            lines.append(f"    {skipped}: empty responses")
         lines.append("")
 
     content = "\n".join(lines)
     if len(content) > 2000:
         content = content[:1997] + "…"
-    await interaction.response.send_message(content, ephemeral=True)
+
+    chart_file = _build_results_chart(exp, tally, rows)
+    if chart_file:
+        await interaction.followup.send(content, file=chart_file, ephemeral=True)
+    else:
+        await interaction.followup.send(content, ephemeral=True)
 
 
 @tree.command(name="export", description="[Experiment manager] Download results as a CSV")
